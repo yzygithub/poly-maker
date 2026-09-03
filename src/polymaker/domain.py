@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 
 
@@ -102,6 +103,24 @@ class MarketMeta:
     @property
     def no(self) -> TokenMeta:
         return self.tokens[1]
+
+    @property
+    def hours_to_end(self) -> float | None:
+        """距 `end_date_iso` 还有多少小时（已过期则为负），未知返回 None。
+
+        生命周期状态机（REDUCE_ONLY / HALTED）和扫描器的 `min_hours_to_end`
+        过滤都依赖它：已经落进 `reduce_only_hours` 的市场无法报价，因此不该
+        出现在可交易列表里。
+        """
+        if not self.end_date_iso:
+            return None
+        try:
+            end = datetime.fromisoformat(self.end_date_iso.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        return (end - datetime.now(UTC)).total_seconds() / 3600.0
 
     def other_token(self, token_id: str) -> str:
         a, b = self.tokens

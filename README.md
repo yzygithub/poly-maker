@@ -45,18 +45,20 @@ cp .env.example .env         # then edit two values:
 Everything else is TOML under [`config/`](config/):
 
 - `config.toml` — wallet/engine/risk/execution settings
-- `strategy.toml` — named parameter profiles (`political-longdated`, `political-hot`)
+- `strategy.toml` — 命名参数 profile（`political-generic` = 默认兜底、
+  `newsom-mm`、`romania-pm`；`livecfg/strategy.toml` 里还有 `live-tiny`）
 - `markets.toml` — the trade list (populated via the CLI below)
 
 ## Use
 
 ```bash
 # 1. discover + rank political markets (writes to state.db)
-uv run polymaker scan
-uv run polymaker markets
+uv run polymaker scan                 # 默认跳过 24 小时内就要结算的市场
+uv run polymaker scan --min-hours-to-end 72 --csv-limit 1000
+uv run polymaker markets              # `ends` 列 = 剩余寿命
 
 # 2. add markets to the trade list
-uv run polymaker markets-add <slug> --profile political-longdated
+uv run polymaker markets-add <slug> --profile political-generic
 
 # 3. dry run: full pipeline against the live feed, no orders posted
 uv run polymaker run --paper
@@ -118,7 +120,15 @@ Maker-only, quoting both sides of each market as USDC-collateralized bids:
 - **Risk** — per-market notional cap, neg-risk event-group worst-case cap, total
   exposure cap, daily-loss kill switch, WS-staleness halt.
 
-Tune it all via profiles in `config/strategy.toml`.
+Tune it all via profiles in `config/strategy.toml`。`political-generic` 是保守的
+默认兜底（`markets-add` 不传 `--profile` 时用它）；打算上额度的市场，请给它单独
+建一个 profile。
+
+> [!IMPORTANT]
+> 所有 `*_ticks` 参数都是「个数 × tick_size」，同一组数字在不同市场上代表的
+> 金额完全不同：`delta_min_ticks = 2` 在 0.001 tick 的市场上是 0.2 美分，在
+> 0.01 tick 的市场上却是 2 美分。复用某个 profile 前，先核对 `markets.csv`
+> 里的 `tick` / `spread` / `best_bid` / `volume_24h`。
 
 ## Develop
 

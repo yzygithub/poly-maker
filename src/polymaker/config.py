@@ -140,7 +140,7 @@ class MarketEntry(BaseModel):
 
     slug: str | None = None
     condition_id: str | None = None
-    profile: str = "political-longdated"
+    profile: str = "political-generic"
     enabled: bool = True
 
     @model_validator(mode="after")

@@ -77,11 +77,60 @@ event_sweep_mult    = 3.0     # thinner book: a smaller print is a real sweep he
 event_sweep_frac    = 0.8     # consuming ~80% of near-touch depth counts
 trend_flow_z        = 2.6     # noisy flow z on a $4k/day tape -> raise the bar
 trend_vol_ratio     = 5.0     # ~1 trade/hr: microprice jitter must NOT halve size
-                              # (real gaps still caught by event_jump_ticks)
+                          # (real gaps still caught by event_jump_ticks)
 # --- lifecycle (end date stale/None -> these are inert; acceptingOrders governs) ---
 end_date_taper_days = 7
 reduce_only_hours   = 24
 halt_before_hours   = 2
 # --- exits ---
+exit_urgency_s      = 900
+merge_min_size      = 20.0
+
+
+# political-generic：没有专门调参的市场所用的默认兜底 profile
+# （`markets-add` 不传 --profile 时用它）。刻意保守 —— 微结构未知，
+# 所以下单额度小、敞口上限紧。
+#
+# TICK 量纲警告（对这里所有 profile 都成立）：所有 `*_ticks` 参数都是
+# “个数 × tick_size”，同一组数字在不同市场上代表的金额完全不同。下面这套
+# 按 0.01（1 美分）tick 设定 —— 政治类市场最常见的情况。放到 0.001 tick 的
+# 市场上会紧 10 倍，放到 0.1 tick 的市场上会宽 10 倍。换市场前务必核对
+# `markets.csv` 里的 tick / spread / best_bid / volume_24h；跑通之后，像
+# newsom-mm / romania-pm 那样给该市场单独建一个 profile。
+[profiles.political-generic]
+micro_levels        = 3
+flow_ewma_halflife_s = 120
+# --- 价差 / 库存倾斜 ---
+gamma               = 0.5
+delta_min_ticks     = 1       # 半价差下限 1 个 tick：贴住盘口
+c_vol               = 1.2
+c_tox               = 2.0
+# --- 波动窗口 ---
+vol_short_halflife_s = 10
+vol_long_halflife_s  = 900
+# --- sizing / 库存（保守：毒性未知 -> 额度小、上限紧） ---
+base_size_usdc      = 25.0
+q_max_usdc          = 100.0   # 净方向敞口上限
+q_soft_frac         = 0.6
+layers              = 1
+reward_size_mult    = 1.0     # 正好等于奖励最小量，不加余量
+layer_step_ticks    = 1
+# --- 挂单 / 防抖动 ---
+reprice_ticks       = 1       # FV 动 1 个 tick 就改价
+resize_frac         = 0.2
+min_edge_ticks      = 1       # 报价不得高于 FV - 1 tick
+# --- 状态机（先取库内默认值；拿到实盘样本后再收紧） ---
+event_cooloff_s     = 60
+event_jump_ticks    = 2       # 1 美分 tick 的市场上 = 2 美分跳变
+event_sweep_levels  = 3
+event_sweep_mult    = 4.0
+event_sweep_frac    = 0.8
+trend_flow_z        = 1.5
+trend_vol_ratio     = 2.0
+# --- 生命周期 ---
+end_date_taper_days = 7
+reduce_only_hours   = 24      # 进入这个区间引擎就转 REDUCE_ONLY
+halt_before_hours   = 2       # ...再往里就是 HALTED
+# --- 退出 ---
 exit_urgency_s      = 900
 merge_min_size      = 20.0

@@ -15,12 +15,14 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from polymaker import __version__
 from polymaker.config import Config
+from polymaker.domain import MarketMeta
 
 app = typer.Typer(
     name="polymaker",
@@ -29,6 +31,23 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+
+def _ends_label(meta: MarketMeta) -> str:
+    """剩余寿命短标签：'12d' / '30h' / 'expired' / '-'（未知）。
+
+    落在 `reduce_only_hours` 内的市场在引擎里是 REDUCE_ONLY，落进
+    `halt_before_hours` 则是 HALTED —— 两种情况都无法报价，绝不能从榜单上
+    挑这种市场。
+    """
+    hours = meta.hours_to_end
+    if hours is None:
+        return "-"
+    if hours <= 0:
+        return "[red]expired[/red]"
+    if hours < 48:
+        return f"[yellow]{hours:.0f}h[/yellow]"
+    return f"{hours / 24.0:.0f}d"
 
 
 @app.command()
@@ -42,6 +61,10 @@ def scan(
     config_dir: str = typer.Option("config", help="config directory"),
     min_liquidity: float = typer.Option(1000.0, help="minimum market liquidity (USDC)"),
     all_markets: bool = typer.Option(False, "--all", help="include non-rewards markets"),
+    min_hours_to_end: float = typer.Option(
+        24.0, help="skip markets that resolve within this many hours (0 disables)"
+    ),
+    csv_limit: int = typer.Option(500, "--csv-limit", help="rows to write to markets.csv"),
 ) -> None:
     """Sweep Gamma for political markets, score, and persist to SQLite."""
     from polymaker.catalog.scanner import ScanConfig, run_scan
@@ -51,15 +74,30 @@ def scan(
     store = CatalogStore(cfg.paths.db)
 
     async def _go() -> int:
-        metas = await run_scan(store, ScanConfig(min_liquidity=min_liquidity, rewards_only=not all_markets))
+        metas = await run_scan(
+            store,
+            ScanConfig(
+                min_liquidity=min_liquidity,
+                rewards_only=not all_markets,
+                min_hours_to_end=min_hours_to_end,
+            ),
+        )
         return len(metas)
 
-    n = asyncio.run(_go())
+    try:
+        n = asyncio.run(_go())
+    except httpx.HTTPError as exc:
+        console.print(f"[red]Scan failed:[/red] could not load reward rates — {exc}")
+        console.print("Retry with [bold]--all[/bold] to scan without the rewards list.")
+        store.close()
+        raise typer.Exit(1) from exc
+
     csv_path = Path(config_dir).parent / "markets.csv"
-    written = store.export_csv(csv_path)
+    written = store.export_csv(csv_path, csv_limit)
     console.print(f"[green]Scanned and stored {n} markets.[/green] "
-                  f"Wrote [bold]{csv_path}[/bold] ({written} rows) — open it, pick markets, "
-                  f"then `polymaker markets-add <slug>`.")
+                  f"Wrote [bold]{csv_path}[/bold] — top {written} of {n} by score "
+                  f"([dim]--csv-limit N[/dim] for more). Pick one, then "
+                  f"[bold]polymaker markets-add <slug> --profile <name>[/bold].")
     store.close()
 
 
@@ -67,34 +105,47 @@ def scan(
 def markets(
     config_dir: str = typer.Option("config", help="config directory"),
     limit: int = typer.Option(25, help="rows to show"),
+    min_hours: float = typer.Option(0.0, help="hide markets resolving within N hours (0 = show all)"),
 ) -> None:
     """Show the top scored markets from the catalog."""
     from polymaker.catalog.store import CatalogStore
 
     cfg = Config.load(config_dir)
     store = CatalogStore(cfg.paths.db)
-    rows = store.top(limit)
+    # 需要过滤时多取一些，保证过滤后仍能凑满一页。
+    candidates = store.top(limit * 3 if min_hours > 0 else limit)
+    rows: list[tuple[MarketMeta, Any]] = []
+    for meta, sc in candidates:
+        if min_hours > 0:
+            hours = meta.hours_to_end
+            if hours is not None and hours < min_hours:
+                continue
+        rows.append((meta, sc))
+        if len(rows) >= limit:
+            break
+    store.close()
     if not rows:
         console.print("[yellow]Catalog empty. Run `polymaker scan` first.[/yellow]")
         raise typer.Exit()
 
     table = Table(title="Political markets by score")
-    for col in ("score", "reward/day", "rebate/day", "spread", "tick", "neg", "question"):
+    for col in ("score", "reward/day", "rebate/day", "spread", "tick", "ends", "neg", "question"):
         table.add_column(col, justify="right" if col != "question" else "left")
     for meta, sc in rows:
         table.add_row(
             f"{sc.score:.2f}", f"{meta.rewards_daily_rate:.0f}", f"{sc.rebate_potential:.0f}",
-            f"{sc.spread:.3f}", f"{meta.tick_size:g}", "Y" if meta.neg_risk else "-",
-            meta.question[:60],
+            f"{sc.spread:.3f}", f"{meta.tick_size:g}", _ends_label(meta),
+            "Y" if meta.neg_risk else "-", meta.question[:60],
         )
     console.print(table)
-    console.print("\nAdd one with: [bold]polymaker markets-add <slug>[/bold]  (slugs are in the catalog)")
+    console.print("\nAdd one with: [bold]polymaker markets-add <slug> --profile <name>[/bold]"
+                  "  (slugs are in the catalog)")
 
 
 @app.command(name="markets-add")
 def markets_add(
     slug: str,
-    profile: str = typer.Option("political-longdated", help="strategy profile"),
+    profile: str = typer.Option("political-generic", help="strategy profile (see config/strategy.toml)"),
     config_dir: str = typer.Option("config", help="config directory"),
 ) -> None:
     """Append a market (by slug) to config/markets.toml."""
