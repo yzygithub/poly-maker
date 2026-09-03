@@ -2,9 +2,10 @@
 [[markets]]
 slug    = "will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568"
 profile = "newsom-mm"
-enabled = true
+enabled = false
 
 [[markets]]
 slug    = "will-alexandru-nazare-be-the-next-prime-minister-of-romania"
 profile = "romania-pm"
-enabled = true
+enabled = false
+

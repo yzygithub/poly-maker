@@ -5,7 +5,10 @@ credentials.json
 */credentials.json
 .env
 .env.*
+!.env.example
 positions/
+.DS_Store
+.codebuddy/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -479,3 +482,7 @@ positions/
 data/
 *.whl
 session/
+
+# local tooling + SDK audit artifacts (see audit handover)
+.uv/
+.audit-sdk/
