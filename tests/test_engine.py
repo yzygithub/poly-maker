@@ -68,6 +68,53 @@ async def test_recompute_is_idempotent_within_tolerance(tmp_path, meta):
     eng.catalog.close()
 
 
+async def test_quote_hold_is_logged_and_throttled(tmp_path, meta):
+    """No-op(报价未变)必须留下存活性信号,且按市场节流,不刷屏。"""
+    eng = _engine_with_market(tmp_path, meta)
+    _feed_book(eng, meta)
+    await eng._recompute(meta.condition_id)  # 首次:下单,不是 no-op
+    assert eng._last_hold_log == {}, "placing is not a no-op, nothing to hold-log"
+
+    await eng._recompute(meta.condition_id)  # 同簿 -> no-op,记录一次
+    ts = eng._last_hold_log.get(meta.condition_id)
+    assert ts is not None, "no-op recompute logged no quote_hold"
+
+    await eng._recompute(meta.condition_id)  # 又一次 no-op -> 被节流
+    assert eng._last_hold_log[meta.condition_id] == ts
+    eng.state.close()
+    eng.catalog.close()
+
+
+async def test_paper_reconcile_preserves_paper_orders(tmp_path, meta):
+    """Paper 模式下 reconcile 循环不得用 REST 快照(恒空)清掉本地纸面订单。
+
+    回归:纸面订单被 30s 一次的 reconcile 当孤儿 wipe,导致 requote 每轮都
+    place=N/cancel=0、订单永不驻留,reprice/cancel 路径在 paper 里测不到。
+    """
+    eng = _engine_with_market(tmp_path, meta)
+    _feed_book(eng, meta)
+    await eng._recompute(meta.condition_id)
+    assert len(eng.state.orders) > 0
+    # 老化 created_ts,确保不会被 replace_open_orders 的 grace_s 保护
+    for o in eng.state.orders.values():
+        o.created_ts = time.time() - 60.0
+    kept = set(eng.state.orders)
+
+    # 手动触发并跑完一轮 _reconcile_loop(python 下无网络 I/O,很快返回)
+    eng._reconcile_now.set()
+    task = asyncio.create_task(eng._reconcile_loop())
+    await asyncio.sleep(0.1)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert set(eng.state.orders) == kept, "paper orders wiped by reconcile"
+    eng.state.close()
+    eng.catalog.close()
+
+
 async def test_recompute_skips_when_book_empty(tmp_path, meta):
     eng = _engine_with_market(tmp_path, meta)
     # no book fed

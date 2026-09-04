@@ -77,6 +77,7 @@ class Engine:
         self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
         self._halted: set[str] = set()  # markets closed/resolved/not-accepting
         self._last_quote_fv: dict[str, float] = {}  # requote suppression
+        self._last_hold_log: dict[str, float] = {}  # quote_hold 节流(no-op 心跳)
         # supervised tasks: name -> (factory, task) so a dead task restarts
         self._task_specs: dict[str, Any] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
@@ -457,6 +458,7 @@ class Engine:
                          reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac)
         if plan.is_noop:
             self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
+            self._note_quote_hold(cid, fv, len(live), regime)
             return
 
         if plan.to_cancel:
@@ -517,6 +519,22 @@ class Engine:
             self.state.replace_open_orders(
                 tok, [o for o in live if o.token_id == tok], grace_s=grace_s
             )
+
+    _hold_log_interval_s: float = 60.0
+
+    def _note_quote_hold(self, cid: str, fv: float, n_orders: int, regime: Regime) -> None:
+        """安静市场 / 纸面运行的存活性心跳。
+
+        报价目标未变时 reconcile 是 no-op,一行日志都不打 —— 无法区分「报价
+        稳定挂在簿上」和「引擎卡死或行情断流」。按市场节流补一条摘要,频率
+        与 requote 基线一致。
+        """
+        now = time.time()
+        if now - self._last_hold_log.get(cid, 0.0) < self._hold_log_interval_s:
+            return
+        self._last_hold_log[cid] = now
+        log.info("quote_hold", cid=cid[:8], regime=regime.value, fv=round(fv, 4),
+                 orders=n_orders)
 
     def _maybe_merge(self, cid: str, meta: MarketMeta, p: StrategyProfile,
                      yes_size: float, no_size: float) -> None:
@@ -591,24 +609,33 @@ class Engine:
                 positions = self._only_traded(await self.gateway.positions())
                 if positions:
                     self.state.reconcile_positions(positions)
-                live = await self.gateway.open_orders()
-                by_token: dict[str, list[Any]] = {}
-                for o in live:
-                    by_token.setdefault(o.token_id, []).append(o)
-                # iterate ALL our tokens, not just those in the REST response — a
-                # token whose orders vanished server-side must be cleaned up too.
-                # Hold the market lock so we don't race the quoter mid-flight.
-                for cid, meta in self.metas.items():
-                    lock = self._locks.get(cid)
-                    if lock is None:
-                        continue
-                    async with lock:
-                        for tok in (meta.yes.token_id, meta.no.token_id):
-                            if self.state.inflight(tok) == 0:
-                                self.state.replace_open_orders(tok, by_token.get(tok, []))
+                open_n = 0
+                if not self.paper:
+                    # 用 exchange REST 快照校准本地订单视图 —— 仅 live 模式适用。
+                    # paper 模式下 gateway.open_orders 恒为空(没有服务器端订单),
+                    # 若仍拿空快照覆盖,本地纸面订单在 grace 窗口后会像孤儿一样被
+                    # 清掉:表现为 requote 每轮都 place=N/cancel=0、订单永不驻留,
+                    # reprice/cancel 等订单管理路径在 paper 中从未被执行。纸面
+                    # 模式下本地 state 就是唯一权威,跳过覆盖。
+                    live = await self.gateway.open_orders()
+                    open_n = len(live)
+                    by_token: dict[str, list[Any]] = {}
+                    for o in live:
+                        by_token.setdefault(o.token_id, []).append(o)
+                    # iterate ALL our tokens, not just those in the REST response — a
+                    # token whose orders vanished server-side must be cleaned up too.
+                    # Hold the market lock so we don't race the quoter mid-flight.
+                    for cid, meta in self.metas.items():
+                        lock = self._locks.get(cid)
+                        if lock is None:
+                            continue
+                        async with lock:
+                            for tok in (meta.yes.token_id, meta.no.token_id):
+                                if self.state.inflight(tok) == 0:
+                                    self.state.replace_open_orders(tok, by_token.get(tok, []))
                 if forced:
                     log.info("forced_reconcile_done", positions=len(positions),
-                             open_orders=len(live))
+                             open_orders=open_n)
                     self._wake_all()
             except Exception as exc:  # noqa: BLE001
                 log.warning("reconcile_error", err=str(exc))
