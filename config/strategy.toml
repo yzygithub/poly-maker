@@ -134,3 +134,177 @@ halt_before_hours   = 2       # ...再往里就是 HALTED
 # --- 退出 ---
 exit_urgency_s      = 900
 merge_min_size      = 20.0
+
+
+# fed-sept-mm：「Will there be no change in Fed interest rates after the
+# September 2026 meeting?」—— 2026-09-04 从 markets.csv 采样：
+#   mid 0.595 / tick 0.01 / spread 0.01（1 tick，1 美分市场能有的最紧价差）
+#   neg_risk = 1，orderMinSize = 5 股，taker 费率 5%（最高档），rebate 25%
+#   rewards_max_spread = 4.5c（= 4.5 tick，是自然价差的 4.5 倍，带宽极宽松）
+#   rewardsMinSize = 200 股（2026-09-04 从网页确认；markets.csv 没有这一列）
+#   liquidity $267k、volume_24h $1.92M
+#   reward pool $1000/天、rebate pool ≈ $9716/天（都是榜首，第二名差两个数量级）
+#   end_date 2026-09-16T00:00:00Z（采样时约剩 11.8 天）
+#
+# 原型与 newsom-mm / romania-pm 完全相反：那两个是「薄 + 安静」，只能挂奖励
+# 最小量；这个是「深 + 忙 + 接近 50/50」，正好是 TIPS.md 第 1 条的反面 ——
+# 「Big size only belongs on deep books you can offload into」，所以敢放大尺寸。
+#
+# 但要害是：taker 费率 5% 是最高档，意味着吃单成本约 2% 名义。愿意付这个钱
+# 来吃单的人大概率带信息，所以这里的**主要风险是逆向选择**，不是流动性。
+# 参数按「贴住盘口去挣那 $9716/天的返佣池 + 一有毒性迹象就拉开」来定，
+# 而不是按 political-generic 那种「躺平吃奖励」的保守姿势来定。
+#
+# TICK 量纲：以下 *_ticks 全部按 tick = 0.01（1 美分）计，与 political-generic
+# 一致。放到 0.001 tick 的市场上会紧 10 倍。
+[profiles.fed-sept-mm]
+micro_levels        = 3
+flow_ewma_halflife_s = 90      # 忙市场：流量信号 90s 半衰期，比 120 稍快一点
+# --- 价差 / 库存倾斜 ---
+gamma               = 0.6
+delta_min_ticks     = 1        # 半价差 1 tick = 1c。自然价差本来就只有 1 tick，
+                               # 再宽就永远排在队列后面一笔都吃不到 —— 而这市场
+                               # 的大头（$9716/天）是返佣，返佣只有成交才有
+c_vol               = 1.2
+c_tox               = 3.0      # 关键项：5% taker 费率 -> 毒性填充代价最高，
+                               # 一旦 markout 转差就把价差拉开（比 generic 的 2.0 高）
+# --- 波动窗口 ---
+vol_short_halflife_s = 10
+vol_long_halflife_s  = 900
+# --- 尺寸 / 库存 ---
+base_size_usdc      = 150.0    # 每边 $120：@0.585 ≈ 205 股，@0.405 ≈ 296 股 ——
+                               # 两边都 ≥ rewardsMinSize(200)，不用靠 _add_layers
+                               # 的上调（那会让名义失控）。反算公式：
+                               #   base = rewardsMinSize × 贵那一边的价 = 200 × 0.585
+                               # 若网页显示的最小份额变了，按这个公式重算
+q_max_usdc          = 200.0    # 净方向敞口上限。别顶满 config.toml 的
+                               # max_market_notional_usdc = 400（那是市场硬顶：
+                               # 挂单 $240 + 库存 $160，已经很紧）
+q_soft_frac         = 0.5      # 净敞口到 $100 就停止加仓那一侧
+layers              = 1        # 必须是 1，理由见文件末尾「layers 警告」
+reward_size_mult    = 1.0      # 不加余量：股数已经够，别再放大名义
+layer_step_ticks    = 1
+# --- 挂单 / 防抖动 ---
+reprice_ticks       = 1        # 1c 容差。1 美分 tick 的市场上 2c 就是一整个价差，
+                               # 再宽等于拿过期报价去撞行情
+resize_frac         = 0.3      # 比 generic 的 0.2 稍粘，但仍允许真实尺寸调整
+min_edge_ticks      = 1        # 报价不得高于 FV - 1 tick
+# --- 状态机 ---
+event_cooloff_s     = 45
+event_jump_ticks    = 3        # 3c ≈ 5% 价格跳变才撤。1 美分 tick 上 2c 太容易误触，
+                               # 误触一次就是 45s 冷却、奖励归零
+event_sweep_levels  = 3
+event_sweep_mult    = 4.0
+event_sweep_frac    = 0.8
+trend_flow_z        = 2.5      # 从 1.5 提上来：$1.9M/天的市场 flow z 常态就偏高
+trend_vol_ratio     = 4.0      # 从 2.0 提上来 —— 这是治「假 TRENDING 抖动」的主药，
+                               # 见 TIPS.md 第 3 条：vol 比值抖动会让尺寸反复腰斩，
+                               # 每次腰斩都是一轮 cancel=2/place=2，白丢队列位置
+# --- 生命周期 ---
+# 注意：end_date_taper_days 目前是死参数（src/ 里没有任何地方读它），
+# 真正生效的是下面两个。
+reduce_only_hours   = 36       # 决议前 36h 转 REDUCE_ONLY（只减不加）
+halt_before_hours   = 6        # 决议前 6h 彻底停。⚠️ 采样时 end_date 是
+                               # 2026-09-16T00:00Z，很可能是「09-15 18:00Z 声明
+                               # + 6h 缓冲」，所以 6h 正好落在声明那一刻。
+                               # 但 FOMC 真实公布时点务必自己核对一次
+# --- 退出 ---
+exit_urgency_s      = 600      # 比 generic 的 900 急：只剩 12 天且事件驱动，别硬扛
+merge_min_size      = 20.0
+#
+# ── 备注 1：layers 必须是 1 ────────────────────────────────────────────────
+# quoting._add_layers 会把「每层」股数上调到 reward_floor：
+#     if 0.5*reward_floor <= per < reward_floor: per = reward_floor
+# per 是每层的量，所以 layers=2 且每层都够不上 floor 时，总名义可能翻到 2 倍。
+# 例：base $120 -> YES 205 股，若开 2 层则每层 102 股，落在
+# [0.5*200, 200) = [100, 200) 区间 -> 每层被顶到 200 -> 总计 400 股 ≈ $234，
+# 是计划名义的 2 倍。layers=1 时 per = total_size，只在股数不够时才顶到 floor。
+#
+# ── 备注 2：rewardsMinSize 与 orderMinSize 是两回事，别搞混 ─────────────────
+#   orderMinSize   = 5   -> markets.csv 的 min_size 列，交易所允许的最小下单股数。
+#                          代码里是 _add_layers(exchange_min=...)，低于它就不下单。
+#   rewardsMinSize = 200 -> 拿到流动性奖励所需的最小股数（本市场，网页确认）。
+#                          代码里是 reward_floor = rewardsMinSize × reward_size_mult
+#                          （quoting.py:77）。低于它奖励直接归零。
+# markets.csv 只有前一列，没有后一列 —— 这是个真缺口，每次换市场都要去网页查。
+# TIPS.md 第 2 条还说这个值会变（见过 50 -> 100），所以定期复核。
+#
+# ── 备注 3：等额美元 -> 份额不等 -> 合并后残差 ~91 股 ────────────────────────
+# 205 股 YES + 296 股 NO，_maybe_merge 只合 min() = 205 对，剩下 91 股 NO
+# （≈ $37 方向敞口，等价于净空 91 股 YES）。而且当前 signature_type=3 且 .env
+# 若没有 POLY_BUILDER_*，merge 是静默失效的（merge.py:97-110），残差只能靠
+# _maybe_exit 的卖单或扛到结算。三条路：补 builder creds / 接受并靠 skew+exit /
+# 改 quoting 让两边按同一股数下单。
+
+
+# minas-mm：「Will Marília Campos win the most votes in the 2026 Minas Gerais
+# Senate election?」—— 2026-09-04 从 markets.csv 采样 + 实盘第一段日志：
+#   mid 0.59 / tick 0.01 / spread 0.02（2 tick）
+#   neg_risk = 1，orderMinSize = 5 股，taker 费率 4%，rebate 25%
+#   rewards_max_spread = 5.5c（宽松）
+#   rewardsMinSize = 20 股（2026-09-05 网页确认；markets.csv 现在有这一列了）
+#   liquidity $3,576、volume_24h **$79**（一天几十美元，基本是死市）
+#   reward pool $116/天、rebate pool **$0.32/天**（返佣可以忽略）
+#   end_date 2026-10-04T06:00:00Z（采样时约剩 30 天）
+#
+# 原型：薄 + 死寂。和 fed-sept-mm 完全相反。TIPS.md 第 1 条的原话就是为这种
+# 市场写的：「On thin/manipulable markets, rest the *minimum* reward-qualifying
+# size... A fill should be small and disposable.」
+#
+# 收入结构决定了姿势：rebate $0.32/天 ≈ 0，所以**全部收入就是那 $116/天的
+# 奖励**。奖励只要求「挂在带内 + 够最小量」，不要求成交。于是最优解是
+# 「挂得够宽、尽量别成交、千万别 churn」—— 成交了反而要承担一个出不掉的
+# 方向仓（TIPS「Getting out」那节：159 股 Romania 平仓吃了 2 个 tick 滑点）。
+#
+# 2026-09-04 实盘暴露的头号问题就是 churn：`trend_vol_ratio=2.0` 在这种
+# 一天 $79 的市场上被 microprice jitter 顶爆 -> 假 TRENDING -> 尺寸腰斩 ->
+# 每 13~25 秒一轮 cancel=2/place=2，白丢队列位置。本 profile 主要是治这个。
+[profiles.minas-mm]
+micro_levels        = 3
+flow_ewma_halflife_s = 120     # 死市，流量信号几乎没有，用默认值即可
+# --- 价差 / 库存倾斜 ---
+gamma               = 0.5
+delta_min_ticks     = 2        # 半价差 2c = 正好一个自然价差。挂出总宽度 4c，
+                               # 仍在 5.5c 奖励带内，但排在盘口后一格 ——
+                               # 死市里"别成交"比"抢成交"更值钱
+c_vol               = 1.0
+c_tox               = 2.5      # 平时 tox=0，但薄书上一旦被砸就是真毒性
+# --- 波动窗口 ---
+vol_short_halflife_s = 10
+vol_long_halflife_s  = 900
+# --- 尺寸 / 库存 ---
+base_size_usdc      = 25.0     # 每边 $25：@0.57 ≈ 44 股，@0.39 ≈ 64 股。
+                               # rewardsMinSize = 20，两边都远超（44 / 64），够格拿奖励。
+                               # 反算公式：base = rewardsMinSize × 贵那边的价 = 20 × 0.57 ≈ $11.4
+                               # 现在挂 $25 是 2 倍最小量 —— TIPS 第 1 条说薄市场该挂
+                               # 「最小奖励量」，但 $11 的单子连 5 股的最小下单量都快
+                               # 贴上了、且 $116/天的池子按份额分，所以留了点余量。
+                               # 若要更保守就改 12.0（YES 21 股 / NO 31 股）
+q_max_usdc          = 100.0    # 净方向敞口上限：死市平不掉仓，敞口要压小
+q_soft_frac         = 0.6
+layers              = 1        # 必须是 1，理由见 fed-sept-mm 备注 1
+reward_size_mult    = 1.0
+layer_step_ticks    = 1
+# --- 挂单 / 防抖动（本 profile 的重点）---
+reprice_ticks       = 2        # 2c 容差：死市里 FV 抖 1c 就改价纯属自残，
+                               # 见 TIPS.md 第 4 条「Make it sticky」
+resize_frac         = 0.6      # 吸收 TRENDING 的尺寸腰斩（配合下面的阈值）
+min_edge_ticks      = 1
+# --- 状态机 ---
+event_cooloff_s     = 45
+event_jump_ticks    = 4        # 4c 才撤：自然价差就有 2c，2c 阈值会天天误触，
+                               # 一次误触就是 45s 冷却、奖励归零
+event_sweep_levels  = 3
+event_sweep_mult    = 3.0      # 薄书：小单就算扫单
+event_sweep_frac    = 0.8
+trend_flow_z        = 2.5      # 几乎没成交，flow z 常态为 0，阈值高也无所谓
+trend_vol_ratio     = 5.0      # ★ 关键修复：从 political-generic 的 2.0 提到 5.0。
+                               # TIPS.md 第 3 条：薄/低频市场上 microprice jitter
+                               # 会虚高 vol ratio -> 假 TRENDING -> 尺寸腰斩 ->
+                               # 一半奖励没了。2026-09-04 实盘就是这个病
+# --- 生命周期 ---
+reduce_only_hours   = 36       # 巴西大选 10/04，开票时段不确定，留足缓冲
+halt_before_hours   = 6
+# --- 退出 ---
+exit_urgency_s      = 900      # 死市急也没用，慢慢挂
+merge_min_size      = 20.0

@@ -117,13 +117,23 @@ class CatalogStore:
         Columns are chosen so you can eyeball reward/rebate income, cost (spread,
         fee category), liquidity, and the exact slug/condition_id to paste into
         markets.toml. Returns the number of rows written.
+
+        `min_size` and `rewards_min_size` are two DIFFERENT minimums and are kept
+        adjacent on purpose (2026-09-05 added the latter):
+          * min_size         = orderMinSize  — the exchange's minimum order size
+                               (shares). Below it the order is not posted at all.
+          * rewards_min_size = rewardsMinSize — the size an order must reach to
+                               score liquidity rewards. Below it the order rests
+                               and can fill, but earns ZERO reward.
+        Sizing rule: base_size_usdc = rewards_min_size x (the more expensive side's
+        price). See TIPS.md #2 — this value also changes over time (seen 50 -> 100).
         """
         rows = self.top(limit)
         fields = [
             "score", "reward_pool_per_day", "rebate_pool_per_day", "spread",
-            "best_bid", "best_ask", "tick", "min_size", "neg_risk", "taker_fee_pct",
-            "rebate_pct", "rewards_max_spread", "liquidity", "volume_24h",
-            "end_date", "question", "slug", "condition_id",
+            "best_bid", "best_ask", "tick", "min_size", "rewards_min_size",
+            "neg_risk", "taker_fee_pct", "rebate_pct", "rewards_max_spread",
+            "liquidity", "volume_24h", "end_date", "question", "slug", "condition_id",
         ]
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
@@ -132,7 +142,8 @@ class CatalogStore:
                 w.writerow([
                     f"{sc.score:.3f}", f"{m.rewards_daily_rate:.2f}", f"{sc.rebate_potential:.2f}",
                     f"{sc.spread:.4f}", m.best_bid, m.best_ask, f"{m.tick_size:g}",
-                    f"{m.min_order_size:g}", int(m.neg_risk), f"{m.taker_fee_bps / 100:.1f}",
+                    f"{m.min_order_size:g}", f"{m.rewards_min_size:g}", int(m.neg_risk),
+                    f"{m.taker_fee_bps / 100:.1f}",
                     f"{m.rebate_rate * 100:.0f}", m.rewards_max_spread, f"{m.liquidity_num:.0f}",
                     f"{m.volume_24hr:.0f}", m.end_date_iso or "", m.question, m.slug, m.condition_id,
                 ])
