@@ -251,7 +251,9 @@ def run(
     from polymaker.logging import configure
 
     cfg = Config.load(config_dir)
-    configure(json_file=Path(cfg.paths.log_dir) / ("paper.jsonl" if paper else "live.jsonl"))
+    # httpx 的逐请求日志(约 6000 行/天)分流到 logs/http.log,控制台只留 4xx/5xx
+    configure(json_file=Path(cfg.paths.log_dir) / ("paper.jsonl" if paper else "live.jsonl"),
+              http_log=Path(cfg.paths.log_dir) / "http.log")
     if cfg.engine.loop == "uvloop":
         try:
             import uvloop

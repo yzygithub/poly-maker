@@ -185,3 +185,111 @@ def test_quiet_regime_clamps_spread_to_reward_band(meta, profile):
     top_yes = max(q.price for q in tq.quotes if q.token_id == "yes-token" and q.side == Side.BUY)
     # bid should be within (band + a tick of rounding) of FV
     assert top_yes >= 0.50 - band - meta.tick_size
+
+
+# ── 两边入场单等额股数 ──────────────────────────────────────────────────────
+
+
+def _buy_sizes(tq, token_id):
+    return [q.size for q in tq.quotes if q.token_id == token_id and q.side == Side.BUY]
+
+
+def test_entries_share_the_same_size(meta, profile):
+    """两边价格不对称时（等额美元会给出不同股数），最终必须统一成同一个股数。
+
+    奖励分 Q_min = min(Q_one, Q_two)、合并也只合 min(yes, no)，股数不等时多出来的
+    那部分是纯浪费，还会留下方向残差。
+    """
+    tq = construct_quotes(_inputs(
+        meta, profile, fv=0.30,
+        yes_view=view(0.29, 0.31), no_view=view(0.67, 0.69),
+    ))
+    yes, no = _buy_sizes(tq, "yes-token"), _buy_sizes(tq, "no-token")
+    assert yes and no
+    assert set(yes) == set(no), (yes, no)
+
+
+def test_equal_share_entries_can_be_disabled(meta, profile):
+    """关掉开关则回到"各算各的"——便宜那边股数更多（这正是残差的来源）。"""
+    kwargs = dict(fv=0.30, yes_view=view(0.29, 0.31), no_view=view(0.67, 0.69))
+    off = construct_quotes(_inputs(meta, profile.with_overrides(
+        {"equal_share_entries": False}), **kwargs))
+    yes, no = _buy_sizes(off, "yes-token"), _buy_sizes(off, "no-token")
+    assert sum(yes) > sum(no)  # YES 便宜 -> 股数更多 -> 合并后会剩 YES
+
+
+def test_equal_share_takes_the_smaller_side(meta, profile):
+    """取较小者，所以总名义只会 <= 各算各的，不会放大风险。"""
+    kwargs = dict(fv=0.30, yes_view=view(0.29, 0.31), no_view=view(0.67, 0.69))
+    both = construct_quotes(_inputs(meta, profile, **kwargs))
+    off = construct_quotes(_inputs(meta, profile.with_overrides(
+        {"equal_share_entries": False}), **kwargs))
+    assert sum(_buy_sizes(both, "yes-token")) <= sum(_buy_sizes(off, "yes-token"))
+    assert sum(_buy_sizes(both, "no-token")) == sum(_buy_sizes(off, "no-token"))
+
+
+# ── 贴盘口（join_touch_ticks）──────────────────────────────────────────────
+
+
+def _top_bid(tq, token_id):
+    ps = [q.price for q in tq.quotes if q.token_id == token_id and q.side == Side.BUY]
+    return max(ps) if ps else None
+
+
+def _one_tick_market(**over):
+    """价差只有 1 个 tick 的市场（Fed 那种）：YES 0.47/0.48，NO 0.52/0.53。"""
+    base = dict(fv=0.475, yes_view=view(0.47, 0.48), no_view=view(0.52, 0.53))
+    base.update(over)
+    return base
+
+
+def test_one_tick_market_defaults_to_second_level(meta, profile):
+    """默认（join_touch_ticks=0）：delta 有 1 tick 硬下限 -> 够不到买一，只能挂买二。"""
+    p = profile.with_overrides({"delta_min_ticks": 1, "min_edge_ticks": 0})
+    tq = construct_quotes(_inputs(meta, p, **_one_tick_market()))
+    assert _top_bid(tq, "yes-token") == 0.46   # best_bid 是 0.47 -> 买二
+    assert _top_bid(tq, "no-token") == 0.51    # NO best_bid 是 0.52 -> 买二
+
+
+def test_join_touch_reaches_best_bid(meta, profile):
+    """开启贴盘口 + min_edge_ticks=0 -> 挂到买一。
+
+    奖励分 S = ((v-s)/v)^2 是二次衰减的，1c 价差市场上买二(s=1.5c) 只有
+    买一(s=0.5c) 的 ~56%（v=4.5c）。
+    """
+    p = profile.with_overrides(
+        {"delta_min_ticks": 1, "min_edge_ticks": 0, "join_touch_ticks": 1})
+    tq = construct_quotes(_inputs(meta, p, **_one_tick_market()))
+    assert _top_bid(tq, "yes-token") == 0.47   # == best_bid
+    assert _top_bid(tq, "no-token") == 0.52    # == NO best_bid
+
+
+def test_join_touch_respects_min_edge(meta, profile):
+    """贴盘口不得突破 min_edge 底线：min_edge_ticks=1 时买一(FV-0.5t) 会被挡掉。
+
+    所以 join_touch_ticks 必须和 min_edge_ticks=0 成对使用，否则开关等于没开。
+    """
+    p = profile.with_overrides(
+        {"delta_min_ticks": 1, "min_edge_ticks": 1, "join_touch_ticks": 1})
+    tq = construct_quotes(_inputs(meta, p, **_one_tick_market()))
+    assert _top_bid(tq, "yes-token") == 0.46   # 仍是买二，join 被 cap 挡回
+    # 而且绝不会高于 FV - min_edge*tick
+    assert _top_bid(tq, "yes-token") <= 0.475 - 1 * meta.tick_size
+
+
+def test_join_touch_never_crosses_the_ask(meta, profile):
+    """即使盘口锁死（买一 == 卖一，退化行情），贴盘口也不能挂到卖一上。"""
+    p = profile.with_overrides(
+        {"delta_min_ticks": 1, "min_edge_ticks": 0, "join_touch_ticks": 1})
+    tq = construct_quotes(_inputs(meta, p, **_one_tick_market(yes_view=view(0.47, 0.47))))
+    top = _top_bid(tq, "yes-token")
+    assert top is not None
+    assert top < 0.47  # 被 "never cross the ask" 拉回一档
+
+
+def test_join_touch_with_wide_range_still_caps_at_best_bid(meta, profile):
+    """join_touch_ticks 放宽的是"够得着"的门槛，不是报价本身 —— 最多只能到买一。"""
+    p = profile.with_overrides(
+        {"delta_min_ticks": 1, "min_edge_ticks": 0, "join_touch_ticks": 5})
+    tq = construct_quotes(_inputs(meta, p, **_one_tick_market()))
+    assert _top_bid(tq, "yes-token") == 0.47  # 买一，不会因为放宽就跑到中价去
