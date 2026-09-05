@@ -12,6 +12,8 @@ Model (see the README):
 
 The BUY-YES + BUY-NO pair is the canonical two-sided quote: both are bids, both
 score rewards, and a filled pair merges back to USDC at locked edge 1 - p - q.
+Both legs are sized to the SAME share count (`equal_share_entries`), which is what
+makes that locked edge exact and leaves no one-sided residue after a merge.
 """
 
 from __future__ import annotations
@@ -99,24 +101,38 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     add_yes = inp.regime not in (Regime.REDUCE_ONLY,) and u < soft_cap
     add_no = inp.regime not in (Regime.REDUCE_ONLY,) and u > -soft_cap
 
-    # entry: BUY YES
+    # ── entry: 先各算各的价与量，再决定最终股数 ──────────────────────────
+    yes_entry: tuple[float, float] | None = None  # (price, shares)
+    no_entry: tuple[float, float] | None = None
     if add_yes:
-        price = _place_bid(yes_bid_target, inp.yes_view, tick, dec, inp.fv, p.min_edge_ticks)
+        price = _place_bid(yes_bid_target, inp.yes_view, tick, dec, inp.fv,
+                           p.min_edge_ticks, p.join_touch_ticks)
         if price is not None:
-            _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
-                        _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m),
-                        p.layers, p.layer_step_ticks, down=True,
-                        exchange_min=m.min_order_size, reward_floor=reward_floor)
-
-    # entry: BUY NO
+            yes_entry = (price, _size_shares(p.base_size_usdc, price,
+                                             common_scale * (1 - max(u, 0.0)), m))
     if add_no:
         no_fv = 1.0 - inp.fv
-        price = _place_bid(no_bid_target, inp.no_view, tick, dec, no_fv, p.min_edge_ticks)
+        price = _place_bid(no_bid_target, inp.no_view, tick, dec, no_fv,
+                           p.min_edge_ticks, p.join_touch_ticks)
         if price is not None:
-            _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,
-                        _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m),
-                        p.layers, p.layer_step_ticks, down=True,
-                        exchange_min=m.min_order_size, reward_floor=reward_floor)
+            no_entry = (price, _size_shares(p.base_size_usdc, price,
+                                            common_scale * (1 - max(-u, 0.0)), m))
+
+    # 等额股数：两边取同一个股数（较小者）。取 min 保证总名义只会 <= 各算各的。
+    # 只有一边报价时（仓位顶到 soft_cap、或某边算不出价）不做对齐，按原样下单。
+    if p.equal_share_entries and yes_entry is not None and no_entry is not None:
+        shared = min(yes_entry[1], no_entry[1])
+        yes_entry = (yes_entry[0], shared)
+        no_entry = (no_entry[0], shared)
+
+    if yes_entry is not None:
+        _add_layers(quotes, m.yes.token_id, Side.BUY, yes_entry[0], tick, dec,
+                    yes_entry[1], p.layers, p.layer_step_ticks, down=True,
+                    exchange_min=m.min_order_size, reward_floor=reward_floor)
+    if no_entry is not None:
+        _add_layers(quotes, m.no.token_id, Side.BUY, no_entry[0], tick, dec,
+                    no_entry[1], p.layers, p.layer_step_ticks, down=True,
+                    exchange_min=m.min_order_size, reward_floor=reward_floor)
 
     # ── exits: SELL held inventory (maker, never cross) ─────────────────
     _maybe_exit(quotes, m.yes.token_id, inp.pos_yes, inp.fv, delta, inp.yes_view, tick, dec,
@@ -135,15 +151,33 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _place_bid(
-    target: float, view: BookView, tick: float, dec: int, fv: float, min_edge_ticks: int
+    target: float,
+    view: BookView,
+    tick: float,
+    dec: int,
+    fv: float,
+    min_edge_ticks: int,
+    join_touch_ticks: int = 0,
 ) -> float | None:
-    """Position a BUY: join the touch or sit behind, never cross, keep min edge vs FV."""
+    """Position a BUY: join the touch or sit behind, never cross, keep min edge vs FV.
+
+    `join_touch_ticks > 0` 时开启「贴盘口」：目标价距买一在 N 个 tick 以内就挂到买一。
+    贴盘口**不会**突破 min_edge 的底线（join 后再取一次 min），所以想真正贴到买一
+    （距 FV 仅 0.5 tick）必须把 min_edge_ticks 设成 0 —— 整 tick 粒度的 min_edge=1
+    会把 0.5 tick 的 edge 挡掉，开关等于没开。
+    """
     price = target
     # never bid above (FV - min_edge*tick): we don't pay through fair value
-    price = min(price, fv - min_edge_ticks * tick)
-    # join the queue rather than jump it (conservative maker default)
-    if view.best_bid is not None and price >= view.best_bid:
-        price = view.best_bid
+    cap = fv - min_edge_ticks * tick
+    price = min(price, cap)
+    # join the queue rather than jump it (conservative maker default).
+    # join_touch_ticks 只是把"够得着盘口"的门槛放宽 N 个 tick；join 之后仍要再过
+    # 一次 cap，所以贴盘口绝不会突破 min_edge。join_touch_ticks=0 时门槛就是
+    # best_bid 本身，且此时 price<=cap 已蕴含 best_bid<=cap，与原行为完全等价。
+    if view.best_bid is not None:
+        threshold = view.best_bid - join_touch_ticks * tick
+        if price >= threshold:
+            price = min(view.best_bid, cap)
     # never cross the ask
     if view.best_ask is not None and price >= view.best_ask:
         price = view.best_ask - tick

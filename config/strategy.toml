@@ -165,21 +165,24 @@ gamma               = 0.6
 delta_min_ticks     = 1        # 半价差 1 tick = 1c。自然价差本来就只有 1 tick，
                                # 再宽就永远排在队列后面一笔都吃不到 —— 而这市场
                                # 的大头（$9716/天）是返佣，返佣只有成交才有
-c_vol               = 1.2
+c_vol               = 0
 c_tox               = 3.0      # 关键项：5% taker 费率 -> 毒性填充代价最高，
                                # 一旦 markout 转差就把价差拉开（比 generic 的 2.0 高）
 # --- 波动窗口 ---
 vol_short_halflife_s = 10
 vol_long_halflife_s  = 900
 # --- 尺寸 / 库存 ---
-base_size_usdc      = 150.0    # 每边 $120：@0.585 ≈ 205 股，@0.405 ≈ 296 股 ——
-                               # 两边都 ≥ rewardsMinSize(200)，不用靠 _add_layers
-                               # 的上调（那会让名义失控）。反算公式：
-                               #   base = rewardsMinSize × 贵那一边的价 = 200 × 0.585
-                               # 若网页显示的最小份额变了，按这个公式重算
+base_size_usdc      = 150.0    # 每边 $150 的预算，但 equal_share_entries 会把两边统一到
+                               # 同一个股数 = min(150/0.46, 150/0.51) ≈ 294 股。
+                               # 实际挂出 YES 294($135) + NO 294($150) ≈ $285。
+                               # 约束是「统一后的股数 >= rewardsMinSize(200)」：
+                               #   base >= 200 × 贵那边的挂单价 = 200 × 0.51 = $102 ✓
+                               # ⚠️ 中价跌破 0.5 后「贵的那边」换成了 NO；再往下走
+                               # （比如到 0.30，NO 挂 0.69）就要 base >= $138，需重算。
+                               # ⚠️ $285 挂单 + max_market_notional_usdc=400 的硬顶，
+                               # 只剩 ~$115 给库存，偏紧 —— 注意别同时再开别的市场。
 q_max_usdc          = 200.0    # 净方向敞口上限。别顶满 config.toml 的
-                               # max_market_notional_usdc = 400（那是市场硬顶：
-                               # 挂单 $240 + 库存 $160，已经很紧）
+                               # max_market_notional_usdc = 400（那是市场硬顶）
 q_soft_frac         = 0.5      # 净敞口到 $100 就停止加仓那一侧
 layers              = 1        # 必须是 1，理由见文件末尾「layers 警告」
 reward_size_mult    = 1.0      # 不加余量：股数已经够，别再放大名义
@@ -188,7 +191,30 @@ layer_step_ticks    = 1
 reprice_ticks       = 1        # 1c 容差。1 美分 tick 的市场上 2c 就是一整个价差，
                                # 再宽等于拿过期报价去撞行情
 resize_frac         = 0.3      # 比 generic 的 0.2 稍粘，但仍允许真实尺寸调整
-min_edge_ticks      = 1        # 报价不得高于 FV - 1 tick
+# ★ 贴盘口（本 profile 的核心改动，两个参数必须成对开）
+#   这个市场价差只有 1 个 tick，而 delta 有 1 tick 的硬下限，导致目标价永远
+#   够不到买一，只能挂买二。开 join_touch_ticks=1 才能挂到买一。
+#   min_edge_ticks 必须为 0：买一距 FV 只有 0.5 tick，整 tick 粒度的
+#   min_edge=1 会把它挡掉，开关就白开了（有单测锁定这个行为）。
+#
+#   实测对比（中价 0.475、买一 0.47/0.52、base=150、两边各 288~294 股）：
+#                挂单价        每对锁定   奖励分 S    挂出总额
+#     买一      0.47/0.52      1.0c      0.790      $285.58
+#     买二      0.46/0.51      3.0c      0.444      $285.30
+#
+#   ⚠️ 注意别搞反：贴到买一之后，**每对赚的价差从 3c 降到 1c**（每边 edge
+#   从 1.5c 降到 0.5c），单笔成交是更差的。收益来自另外两头：
+#     ① 成交频率大幅提高 -> 返佣池 $9522/天是按 maker 成交份额分的，
+#        是奖励池($1000/天)的 9.5 倍，必须靠成交量拿；
+#     ② 奖励分 0.444 -> 0.790（+78%），因为 S=((4.5-s)/4.5)^2 是二次衰减。
+#   如果哪天返佣池塌了或毒性太高，把 join_touch_ticks 改回 0 就退回买二。
+#
+#   安全边界仍在：delta >= 1 tick、只挂在 best_bid、post_only、以及 c_tox=3.0
+#   （markout 转差会把 delta 拉宽，自动把我们拽回盘口后面）。
+join_touch_ticks    = 1
+min_edge_ticks      = 0
+equal_share_entries = true     # 两边同一个股数：奖励分取 min(Q_one,Q_two)、
+                               # 合并也只合 min(yes,no)，股数相等才不浪费、不留残差
 # --- 状态机 ---
 event_cooloff_s     = 45
 event_jump_ticks    = 3        # 3c ≈ 5% 价格跳变才撤。1 美分 tick 上 2c 太容易误触，
@@ -237,7 +263,7 @@ merge_min_size      = 20.0
 # 改 quoting 让两边按同一股数下单。
 
 
-# minas-mm：「Will Marília Campos win the most votes in the 2026 Minas Gerais
+# brazil-senate-thin：「Will Marília Campos win the most votes in the 2026 Minas Gerais
 # Senate election?」—— 2026-09-04 从 markets.csv 采样 + 实盘第一段日志：
 #   mid 0.59 / tick 0.01 / spread 0.02（2 tick）
 #   neg_risk = 1，orderMinSize = 5 股，taker 费率 4%，rebate 25%
@@ -259,12 +285,12 @@ merge_min_size      = 20.0
 # 2026-09-04 实盘暴露的头号问题就是 churn：`trend_vol_ratio=2.0` 在这种
 # 一天 $79 的市场上被 microprice jitter 顶爆 -> 假 TRENDING -> 尺寸腰斩 ->
 # 每 13~25 秒一轮 cancel=2/place=2，白丢队列位置。本 profile 主要是治这个。
-[profiles.minas-mm]
+[profiles.brazil-senate-thin]
 micro_levels        = 3
 flow_ewma_halflife_s = 120     # 死市，流量信号几乎没有，用默认值即可
 # --- 价差 / 库存倾斜 ---
 gamma               = 0.5
-delta_min_ticks     = 2        # 半价差 2c = 正好一个自然价差。挂出总宽度 4c，
+delta_min_ticks     = 1        # 半价差 2c = 正好一个自然价差。挂出总宽度 4c，
                                # 仍在 5.5c 奖励带内，但排在盘口后一格 ——
                                # 死市里"别成交"比"抢成交"更值钱
 c_vol               = 1.0
@@ -289,7 +315,9 @@ layer_step_ticks    = 1
 reprice_ticks       = 2        # 2c 容差：死市里 FV 抖 1c 就改价纯属自残，
                                # 见 TIPS.md 第 4 条「Make it sticky」
 resize_frac         = 0.6      # 吸收 TRENDING 的尺寸腰斩（配合下面的阈值）
-min_edge_ticks      = 1
+min_edge_ticks      = 0
+join_touch_ticks    = 1
+equal_share_entries = true
 # --- 状态机 ---
 event_cooloff_s     = 45
 event_jump_ticks    = 4        # 4c 才撤：自然价差就有 2c，2c 阈值会天天误触，

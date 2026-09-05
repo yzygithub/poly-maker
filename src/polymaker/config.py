@@ -97,6 +97,22 @@ class StrategyProfile(BaseModel):
     reprice_ticks: int = 2
     resize_frac: float = 0.15
     min_edge_ticks: int = 1
+    # 贴盘口：报价目标距买一在 N 个 tick 以内时，直接挂在买一。0 = 关闭（保持原行为：
+    # 只有目标价已 >= 买一才 join）。
+    # 为什么要这个开关：delta 有硬下限 1 个 tick（quoting.py 的 max(delta, tick)），
+    # 所以在「价差只有 1 个 tick」的市场上，目标价 = FV - 1 tick 永远低于买一
+    # （买一距中价只有 0.5 tick），结果只能挂到买二。而奖励分是二次衰减的
+    # S = ((v-s)/v)^2，以 v=4.5c 为例：买一(s=0.5c) 得 0.790，买二(s=1.5c) 只有 0.444，
+    # 差 44%。深 + 忙、靠返佣（必须成交）赚钱的市场值得开；薄 + 死的市场别开。
+    # 注意：开这个必须同时把 min_edge_ticks 设成 0，否则「不得低于 FV - min_edge*tick」
+    # 这条底线会把买一（FV - 0.5 tick）挡掉，开关白开。
+    join_touch_ticks: int = 0
+    # 两边入场单（BUY YES / BUY NO）用同一个股数。
+    # 理由有三条且互相独立：① 奖励分 Q_min = min(Q_one, Q_two)，股数不等时多出来的
+    # 那部分对奖励是纯浪费；② 合并只合 min(yes, no)，股数相等才能合干净、不留方向残差；
+    # ③ 等额美元会让便宜那一边股数更多，长期形成「结构性囤便宜一侧」的库存偏向。
+    # 实现上取两边的较小者，所以总名义只会 <= 各算各的，不会放大风险。
+    equal_share_entries: bool = True
     # regime
     event_cooloff_s: float = 60.0
     event_jump_ticks: int = 8
